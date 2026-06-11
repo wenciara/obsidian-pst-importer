@@ -7,11 +7,13 @@ import { PstImporterSettingTab } from "./settings";
 import type {
   ExtractionEngine,
   PstImporterSettings,
+  SyncProfile,
 } from "./types";
-import { DEFAULT_SETTINGS } from "./types";
+import { DEFAULT_SETTINGS, emailFingerprint } from "./types";
 import { VaultWriter } from "./vault-writer";
 import { ProgressModal } from "./progress-modal";
 import { FallbackEngine } from "./engines/fallback-engine";
+import { SyncStateManager } from "./sync-state";
 import * as path from "path";
 import * as fs from "fs";
 interface ElectronLike {
@@ -28,6 +30,7 @@ interface ElectronLike {
 
 export default class PstImporterPlugin extends Plugin {
   settings: PstImporterSettings;
+  syncStateManager: SyncStateManager;
 
   constructor(app: App, manifest: PluginManifest) {
     super(app, manifest);
@@ -36,12 +39,28 @@ export default class PstImporterPlugin extends Plugin {
   async onload(): Promise<void> {
     await this.loadSettings();
 
-    // 注册 "Import PST file..." 命令
+    // 初始化同步状态管理器
+    this.syncStateManager = new SyncStateManager(
+      () => this.loadData() as Promise<Record<string, unknown> | null>,
+      (data) => this.saveData(data)
+    );
+    await this.syncStateManager.load();
+
+    // 注册 "Import PST file..." 命令（手动导入任意 PST）
     this.addCommand({
       id: "import-pst-file",
       name: "Import PST file...",
       callback: () => {
         void this.startImport();
+      },
+    });
+
+    // 注册 "Sync PST" 命令（增量同步已配置的 PST）
+    this.addCommand({
+      id: "sync-pst",
+      name: "Sync configured PST (incremental)",
+      callback: () => {
+        void this.startSync();
       },
     });
 
@@ -109,14 +128,11 @@ export default class PstImporterPlugin extends Plugin {
       // 选择引擎
       const engine = await this.selectEngine(fileSize);
       if (!engine) {
-        new Notice(
-          "PST Import: 未找到可用解析引擎。\n" +
-          "请确认：1. Outlook 已安装  2. 插件目录下有 pst-importer.exe 或 Python 环境可用"
-        );
+        new Notice("PST Import: No available parsing engine found.");
         return;
       }
 
-      new Notice(`PST Import: 使用 ${engine.name} 引擎`);
+      new Notice(`PST Import: Using ${engine.name} engine`);
       console.log(`PST Import: using engine ${engine.name}`);
 
       // 弹输入框让用户输入导入后的文件夹名
@@ -148,7 +164,7 @@ export default class PstImporterPlugin extends Plugin {
 
       // 开始提取
       modal.open();
-      modal.setStatus("正在提取邮件...");
+      modal.setStatus("Extracting emails...");
 
       try {
         const vaultWriter = new VaultWriter(
@@ -174,46 +190,156 @@ export default class PstImporterPlugin extends Plugin {
               errorCount++;
               const errMsg = writeErr instanceof Error ? writeErr.message : String(writeErr);
               console.error("PST Import: write error for email:", email.subject?.substring(0, 50), writeErr);
-              modal.setStatus(`⚠️ 第 ${emailCount + errorCount} 封写入失败: ${errMsg}`);
+              modal.setStatus(`⚠️ Write failed for email #${emailCount + errorCount}: ${errMsg}`);
             }
 
             if ((emailCount + errorCount) % 10 === 0 && emailCount > 0) {
-              modal.setStatus(`已处理 ${emailCount} 封邮件${errorCount > 0 ? ` (${errorCount} 封失败)` : ""}`);
+              modal.setStatus(`Processed ${emailCount} emails${errorCount > 0 ? ` (${errorCount} failed)` : ""}`);
             }
           }
         } catch (extractErr) {
           // extract() 抛异常（无法打开 PST 等）
           const errMsg = extractErr instanceof Error ? extractErr.message : String(extractErr);
           console.error("PST Import: extraction stream error:", extractErr);
-          modal.setStatus(`❌ 提取失败：${errMsg}`);
+          modal.setStatus(`❌ Extraction failed: ${errMsg}`);
           modal.markError();
-          new Notice(`PST 提取失败：${errMsg}`);
+          new Notice(`PST extraction failed: ${errMsg}`);
           return;
         }
 
-        modal.setStatus(`✅ 导入完成！共 ${emailCount} 封邮件${errorCount > 0 ? `，${errorCount} 封失败` : ""}`);
+        modal.setStatus(`✅ Import complete! ${emailCount} emails${errorCount > 0 ? `, ${errorCount} failed` : ""}`);
         modal.markComplete();
 
-        new Notice(`PST 导入完成：${emailCount} 封邮件${errorCount > 0 ? `，${errorCount} 封失败` : ""}`);
+        new Notice(`PST import complete: ${emailCount} emails${errorCount > 0 ? `, ${errorCount} failed` : ""}`);
         console.log(`PST Import: done, ${emailCount} emails, ${errorCount} errors`);
       } catch (err) {
         console.error("PST Import: extraction/write error:", err);
         const errMsg = err instanceof Error ? err.message : String(err);
-        modal.setStatus(`❌ 导入出错：${errMsg}`);
+        modal.setStatus(`❌ Import error: ${errMsg}`);
         modal.markError();
-        new Notice(`PST 导入失败：${errMsg}`);
+        new Notice(`PST import failed: ${errMsg}`);
       }
     } catch (err) {
       console.error("PST Import: top-level error:", err);
       const errMsg = err instanceof Error ? err.message : String(err);
-      new Notice(`PST Import 错误：${errMsg}`);
+      new Notice(`PST Import error: ${errMsg}`);
       console.error("PST Import error:", err);
     }
   }
 
   /**
+   * 增量同步：只导入已配置 PST 中的新邮件
+   */
+  async startSync(): Promise<void> {
+    const profiles = this.settings.syncProfiles;
+    if (profiles.length === 0) {
+      new Notice("No sync profile configured. Go to Settings → PST Import to add one.");
+      return;
+    }
+
+    // 如果只有一个 profile，直接同步；否则让用户选择
+    let profile: SyncProfile;
+    if (profiles.length === 1) {
+      profile = profiles[0];
+    } else {
+      const chosen = await this.askProfileSelection(profiles);
+      if (!chosen) return;
+      profile = chosen;
+    }
+
+    // 验证 PST 文件存在
+    if (!fs.existsSync(profile.pstPath)) {
+      new Notice(`PST file not found: ${profile.pstPath}`);
+      return;
+    }
+
+    const engine = await this.selectEngine(0);
+    if (!engine) {
+      new Notice("PST Import: No available parsing engine.");
+      return;
+    }
+
+    // 加载同步状态
+    await this.syncStateManager.load();
+    const importedSet = this.syncStateManager.getImportedSet(profile.label);
+
+    const modal = new ProgressModal(this.app);
+    modal.open();
+    modal.setStatus("Scanning for new emails...");
+
+    try {
+      await this.ensureOutputBaseFolder(profile.outputFolder);
+
+      const vaultWriter = new VaultWriter(
+        this.app.vault,
+        this.settings,
+        profile.outputFolder
+      );
+
+      let newCount = 0;
+      let skipCount = 0;
+      let errorCount = 0;
+
+      const selectedFolders = profile.selectedFolders.length > 0
+        ? profile.selectedFolders
+        : undefined;
+
+      for await (const email of engine.extract(profile.pstPath, (p) => {
+        modal.updateProgress(p);
+      }, selectedFolders)) {
+        const fp = emailFingerprint(email);
+
+        if (importedSet.has(fp)) {
+          skipCount++;
+          if (skipCount % 50 === 0) {
+            modal.setStatus(`Skipped ${skipCount} existing, imported ${newCount} new...`);
+          }
+          continue;
+        }
+
+        try {
+          await vaultWriter.writeEmail(email);
+          newCount++;
+          this.syncStateManager.markImported(profile.label, fp);
+        } catch (writeErr) {
+          errorCount++;
+          const errMsg = writeErr instanceof Error ? writeErr.message : String(writeErr);
+          console.error("PST Import: sync write error:", email.subject?.substring(0, 50), errMsg);
+        }
+
+        if (newCount % 10 === 0 && newCount > 0) {
+          modal.setStatus(`Imported ${newCount} new emails (${skipCount} skipped)...`);
+        }
+      }
+
+      // 保存同步状态
+      this.syncStateManager.updateLastSync(profile.label);
+      await this.syncStateManager.save();
+
+      const msg = `Sync complete: ${newCount} new emails imported, ${skipCount} skipped${errorCount > 0 ? `, ${errorCount} errors` : ""}`;
+      modal.setStatus(`✅ ${msg}`);
+      modal.markComplete();
+      new Notice(msg);
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      modal.setStatus(`❌ Sync failed: ${errMsg}`);
+      modal.markError();
+      new Notice(`PST Sync failed: ${errMsg}`);
+    }
+  }
+
+  /**
+   * 让用户选择一个 sync profile
+   */
+  private askProfileSelection(profiles: SyncProfile[]): Promise<SyncProfile | null> {
+    return new Promise((resolve) => {
+      const modal = new ProfileSelectModal(this.app, profiles, resolve);
+      modal.open();
+    });
+  }
+
+  /**
    * 选择可用的解析引擎
-   * 使用 pst-extractor（纯 JS，支持任意大小 Unicode PST）
    */
   private async selectEngine(fileSize: number): Promise<ExtractionEngine | null> {
     const jsEngine = new FallbackEngine();
@@ -234,7 +360,7 @@ export default class PstImporterPlugin extends Plugin {
       const remote = electron.remote;
       if (remote?.dialog) {
         const result = await remote.dialog.showOpenDialog({
-          title: "选择 PST 文件",
+          title: "Select PST File",
           filters: [{ name: "PST Files", extensions: ["pst", "PST"] }],
           properties: ["openFile"],
         });
@@ -350,8 +476,8 @@ class FolderNameModal extends Modal {
     const { contentEl } = this;
     contentEl.empty();
 
-    contentEl.createEl("h2", { text: "导入 PST 文件" });
-    contentEl.createEl("p", { text: "请输入导入后在 vault 中的文件夹名称：" });
+    contentEl.createEl("h2", { text: "Import PST File" });
+    contentEl.createEl("p", { text: "Enter the folder name in your vault for imported emails:" });
 
     let inputValue = this.defaultName;
 
@@ -375,7 +501,7 @@ class FolderNameModal extends Modal {
     window.setTimeout(() => inputEl.focus(), 100);
 
     new Setting(contentEl).addButton((btn) => {
-      btn.setButtonText("开始导入");
+      btn.setButtonText("Start Import");
       btn.setCta();
       btn.onClick(() => {
         const name = inputValue.trim() || this.defaultName;
@@ -385,7 +511,7 @@ class FolderNameModal extends Modal {
     });
 
     new Setting(contentEl).addButton((btn) => {
-      btn.setButtonText("取消");
+      btn.setButtonText("Cancel");
       btn.onClick(() => {
         this.callback(null);
         this.close();
@@ -400,7 +526,7 @@ class FolderNameModal extends Modal {
 }
 
 /**
- * 邮件夹多选弹窗
+ * Folder multi-select modal
  */
 class FolderSelectModal extends Modal {
   private folders: string[];
@@ -418,7 +544,7 @@ class FolderSelectModal extends Modal {
   private updateButtonText() {
     if (this.confirmBtn) {
       const count = this.selected.size;
-      this.confirmBtn.textContent = `开始导入 (${count} 个文件夹)`;
+      this.confirmBtn.textContent = `Import (${count} folders)`;
     }
   }
 
@@ -426,8 +552,8 @@ class FolderSelectModal extends Modal {
     const { contentEl } = this;
     contentEl.empty();
 
-    contentEl.createEl("h2", { text: "选择要导入的邮件夹" });
-    contentEl.createEl("p", { text: `共 ${this.folders.length} 个邮件夹，取消勾选可跳过不需要的文件夹：` });
+    contentEl.createEl("h2", { text: "Select folders to import" });
+    contentEl.createEl("p", { text: `${this.folders.length} folders found. Uncheck folders you want to skip:` });
 
     const listEl = contentEl.createDiv({ cls: "pst-folder-select-list" });
 
@@ -451,7 +577,7 @@ class FolderSelectModal extends Modal {
     // 全选/取消全选按钮
     const btnRow = contentEl.createDiv({ cls: "pst-folder-select-buttons" });
 
-    const selectAllBtn = btnRow.createEl("button", { text: "全选" });
+    const selectAllBtn = btnRow.createEl("button", { text: "Select All" });
     selectAllBtn.addEventListener("click", () => {
       const checkboxes = listEl.querySelectorAll("input[type=checkbox]");
       checkboxes.forEach((cb) => {
@@ -461,7 +587,7 @@ class FolderSelectModal extends Modal {
       this.updateButtonText();
     });
 
-    const deselectAllBtn = btnRow.createEl("button", { text: "取消全选" });
+    const deselectAllBtn = btnRow.createEl("button", { text: "Deselect All" });
     deselectAllBtn.addEventListener("click", () => {
       const checkboxes = listEl.querySelectorAll("input[type=checkbox]");
       checkboxes.forEach((cb) => {
@@ -476,7 +602,7 @@ class FolderSelectModal extends Modal {
 
     new Setting(contentEl).addButton((btn) => {
       this.confirmBtn = btn.buttonEl;
-      btn.setButtonText(`开始导入 (${this.folders.length} 个文件夹)`);
+      btn.setButtonText(`Import (${this.folders.length} folders)`);
       btn.setCta();
       btn.onClick(() => {
         const result = Array.from(this.selected);
@@ -486,7 +612,55 @@ class FolderSelectModal extends Modal {
     });
 
     new Setting(contentEl).addButton((btn) => {
-      btn.setButtonText("取消");
+      btn.setButtonText("Cancel");
+      btn.onClick(() => {
+        this.callback(null);
+        this.close();
+      });
+    });
+  }
+
+  onClose() {
+    const { contentEl } = this;
+    contentEl.empty();
+  }
+}
+
+/**
+ * Sync profile 选择弹窗
+ */
+class ProfileSelectModal extends Modal {
+  private profiles: SyncProfile[];
+  private callback: (result: SyncProfile | null) => void;
+
+  constructor(app: App, profiles: SyncProfile[], callback: (result: SyncProfile | null) => void) {
+    super(app);
+    this.profiles = profiles;
+    this.callback = callback;
+  }
+
+  onOpen() {
+    const { contentEl } = this;
+    contentEl.empty();
+
+    contentEl.createEl("h2", { text: "Select sync profile" });
+
+    for (const profile of this.profiles) {
+      new Setting(contentEl)
+        .setName(profile.label)
+        .setDesc(profile.pstPath)
+        .addButton((btn) => {
+          btn.setButtonText("Sync");
+          btn.setCta();
+          btn.onClick(() => {
+            this.callback(profile);
+            this.close();
+          });
+        });
+    }
+
+    new Setting(contentEl).addButton((btn) => {
+      btn.setButtonText("Cancel");
       btn.onClick(() => {
         this.callback(null);
         this.close();

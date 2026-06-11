@@ -1,9 +1,23 @@
 /**
- * PST Importer — 设置界面
+ * PST Importer — Settings UI
  */
 
-import { App, PluginSettingTab, Setting } from "obsidian";
+import { App, PluginSettingTab, Setting, Notice } from "obsidian";
 import PstImporterPlugin from "./main";
+import type { SyncProfile } from "./types";
+import { FallbackEngine } from "./engines/fallback-engine";
+
+interface ElectronLike {
+  remote?: {
+    dialog?: {
+      showOpenDialog(options: {
+        title: string;
+        filters: Array<{ name: string; extensions: string[] }>;
+        properties: string[];
+      }): Promise<{ canceled: boolean; filePaths: string[] }>;
+    };
+  };
+}
 
 export class PstImporterSettingTab extends PluginSettingTab {
   plugin: PstImporterPlugin;
@@ -17,11 +31,12 @@ export class PstImporterSettingTab extends PluginSettingTab {
     const { containerEl } = this;
     containerEl.empty();
 
-    new Setting(containerEl).setHeading().setName("PST Import 设置");
+    // === General Settings ===
+    new Setting(containerEl).setHeading().setName("General Settings");
 
     new Setting(containerEl)
-      .setName("输出基目录")
-      .setDesc("导入的邮件将存放在 vault 中的此目录下")
+      .setName("Output base folder")
+      .setDesc("Imported emails will be placed in this vault folder")
       .addText((text) =>
         text
           .setPlaceholder("PST Import")
@@ -33,8 +48,8 @@ export class PstImporterSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
-      .setName("保留 PST 文件夹层级")
-      .setDesc("开启后，收件箱中的子文件夹会创建为子目录")
+      .setName("Mirror PST folder structure")
+      .setDesc("When enabled, subfolders in the PST will be created as subdirectories")
       .addToggle((toggle) =>
         toggle
           .setValue(this.plugin.settings.mirrorFolderStructure)
@@ -45,8 +60,8 @@ export class PstImporterSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
-      .setName("覆盖已有文件")
-      .setDesc("导入同名邮件时是否覆盖已有的 Markdown 文件")
+      .setName("Overwrite existing files")
+      .setDesc("Whether to overwrite existing Markdown files when importing emails with the same name")
       .addToggle((toggle) =>
         toggle
           .setValue(this.plugin.settings.overwriteExisting)
@@ -57,8 +72,8 @@ export class PstImporterSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
-      .setName("生成 YAML 头部元数据")
-      .setDesc("每封邮件顶部添加发件人、收件人、时间等元数据")
+      .setName("Include YAML frontmatter")
+      .setDesc("Add sender, recipients, date and other metadata at the top of each email")
       .addToggle((toggle) =>
         toggle
           .setValue(this.plugin.settings.includeYamlFrontmatter)
@@ -68,5 +83,131 @@ export class PstImporterSettingTab extends PluginSettingTab {
           })
       );
 
+    // === Sync Profiles ===
+    new Setting(containerEl).setHeading().setName("Incremental Sync Profiles");
+
+    const profiles = this.plugin.settings.syncProfiles;
+
+    if (profiles.length === 0) {
+      containerEl.createEl("p", {
+        text: "No sync profiles configured. Add a profile to enable incremental sync.",
+        cls: "setting-item-description",
+      });
+    }
+
+    for (let i = 0; i < profiles.length; i++) {
+      const profile = profiles[i];
+      const profileState = this.plugin.syncStateManager.getProfileState(profile.label);
+      const desc = profileState
+        ? `${profile.pstPath}\nLast sync: ${new Date(profileState.lastSync).toLocaleString()} | ${profileState.imported.length} emails synced`
+        : `${profile.pstPath}\nNot yet synced`;
+
+      new Setting(containerEl)
+        .setName(profile.label)
+        .setDesc(desc)
+        .addButton((btn) => {
+          btn.setButtonText("Edit");
+          btn.onClick(() => {
+            void this.editProfile(i);
+          });
+        })
+        .addButton((btn) => {
+          btn.setButtonText("Delete");
+          btn.setWarning();
+          btn.onClick(async () => {
+            profiles.splice(i, 1);
+            this.plugin.syncStateManager.deleteProfile(profile.label);
+            await this.plugin.syncStateManager.save();
+            await this.plugin.saveSettings();
+            this.display();
+          });
+        });
+    }
+
+    new Setting(containerEl).addButton((btn) => {
+      btn.setButtonText("Add Sync Profile");
+      btn.setCta();
+      btn.onClick(() => {
+        void this.addProfile();
+      });
+    });
+  }
+
+  private async addProfile(): Promise<void> {
+    // Pick PST file
+    const pstPath = await this.choosePstFile();
+    if (!pstPath) return;
+
+    // Default label from filename
+    const defaultLabel = pstPath.replace(/^.*[\\/]/, "").replace(/\.pst$/i, "");
+
+    // Scan folders
+    let folders: string[] = [];
+    try {
+      folders = FallbackEngine.scanPstFolders(pstPath);
+    } catch (e) {
+      new Notice(`Failed to scan PST: ${e instanceof Error ? e.message : String(e)}`);
+      return;
+    }
+
+    const profile: SyncProfile = {
+      label: defaultLabel,
+      pstPath,
+      outputFolder: defaultLabel,
+      selectedFolders: folders,
+    };
+
+    this.plugin.settings.syncProfiles.push(profile);
+    await this.plugin.saveSettings();
+    this.display();
+    new Notice(`Sync profile "${defaultLabel}" added. Use "Sync configured PST" command to sync.`);
+  }
+
+  private async editProfile(index: number): Promise<void> {
+    const profile = this.plugin.settings.syncProfiles[index];
+    if (!profile) return;
+
+    // Re-scan folders from PST
+    let folders: string[] = [];
+    try {
+      folders = FallbackEngine.scanPstFolders(profile.pstPath);
+    } catch (e) {
+      new Notice(`Failed to scan PST: ${e instanceof Error ? e.message : String(e)}`);
+      return;
+    }
+
+    // Update available folders (keep existing selection if still valid)
+    const validFolders = new Set(folders);
+    profile.selectedFolders = profile.selectedFolders.filter((f) => validFolders.has(f));
+    if (profile.selectedFolders.length === 0) {
+      profile.selectedFolders = folders;
+    }
+
+    await this.plugin.saveSettings();
+    this.display();
+    new Notice(`Profile "${profile.label}" refreshed: ${folders.length} folders available.`);
+  }
+
+  private async choosePstFile(): Promise<string | null> {
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-var-requires, @typescript-eslint/no-require-imports -- Obsidian runs in Electron
+      const electron = require("electron") as ElectronLike;
+      const remote = electron.remote;
+      if (remote?.dialog) {
+        const result = await remote.dialog.showOpenDialog({
+          title: "Select PST File",
+          filters: [{ name: "PST Files", extensions: ["pst", "PST"] }],
+          properties: ["openFile"],
+        });
+        if (!result.canceled && result.filePaths.length > 0) {
+          return result.filePaths[0];
+        }
+        return null;
+      }
+    } catch {
+      // Electron dialog unavailable
+    }
+    new Notice("File dialog unavailable. Please enter the PST path manually.");
+    return null;
   }
 }

@@ -2,9 +2,8 @@
  * PST Importer — 后备引擎
  *
  * 使用 pst-extractor 纯 JavaScript 库解析 PST 文件。
- * 当 Outlook 未安装时作为降级方案。
- *
- * 注意：pst-extractor 不支持 > 2GB 的 PST 文件。
+ * 采用流式读取（getNextChild），没有严格的文件大小限制。
+ * 超大文件（>5GB）可以正常解析，但处理时间较长。
  */
 
 import { AttachmentData, EmailData, ExtractionEngine, ProgressEvent } from "../types";
@@ -241,16 +240,16 @@ export class FallbackEngine implements ExtractionEngine {
     const stat = fs_extra.statSync(pstPath);
     console.log("PST Import: file size:", stat.size);
     if (stat.size > 2 * 1024 * 1024 * 1024) {
-      console.log("PST Import: file >2GB, attempting pst-extractor anyway (Unicode PST may work)...");
+      console.log("PST Import: file >2GB, this will take a while...");
       onProgress({
         type: "folder",
-        message: "文件超过 2GB，尝试直接读取...",
+        message: "Large file detected (>2 GB) — import will take longer than usual...",
       });
     }
 
     onProgress({
       type: "folder",
-      message: "正在读取 PST 文件...",
+      message: "Reading PST file...",
     });
 
     console.log("PST Import: opening PST file...");
@@ -370,7 +369,7 @@ export class FallbackEngine implements ExtractionEngine {
   ): AsyncGenerator<EmailData> {
     onProgress({
       type: "folder",
-      message: `正在处理文件夹: ${currentPath}`,
+      message: `Processing folder: ${currentPath}`,
       folderPath: currentPath,
     });
 
@@ -388,7 +387,7 @@ export class FallbackEngine implements ExtractionEngine {
           type: "email",
           current: processed,
           total: totalItems,
-          message: `正在提取: ${msg.subject || "No Subject"}`,
+          message: `Extracting: ${msg.subject || "No Subject"}`,
           emailSubject: msg.subject,
         });
 

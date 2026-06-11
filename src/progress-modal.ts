@@ -35,11 +35,11 @@ export class ProgressModal extends Modal {
     const { contentEl } = this;
     contentEl.empty();
 
-    contentEl.createEl("h2", { text: "正在导入 PST..." });
+    contentEl.createEl("h2", { text: "Importing PST..." });
 
     // 当前文件夹
     this.folderEl = contentEl.createDiv({ cls: "pst-importer-folder" });
-    this.folderEl.setText("准备中...");
+    this.folderEl.setText("Preparing...");
 
     // 进度条（使用原生 progress，避免直接样式赋值）
     this.progressEl = contentEl.createEl("progress", {
@@ -52,7 +52,7 @@ export class ProgressModal extends Modal {
 
     // 状态文字
     this.statusEl = contentEl.createDiv({ cls: "pst-importer-status" });
-    this.statusEl.setText("正在提取邮件...");
+    this.statusEl.setText("Extracting emails...");
 
     // 详细信息
     this.detailEl = contentEl.createDiv({ cls: "pst-importer-detail" });
@@ -60,11 +60,11 @@ export class ProgressModal extends Modal {
     // 取消按钮
     new Setting(contentEl).addButton((btn) => {
       this.cancelBtn = btn.buttonEl;
-      btn.setButtonText("取消");
+      btn.setButtonText("Cancel");
       btn.onClick(() => {
         this._cancelled = true;
         this._resolveCancel();
-        this.cancelBtn.setText("正在取消...");
+        this.cancelBtn.setText("Cancelling...");
         this.cancelBtn.disabled = true;
       });
     });

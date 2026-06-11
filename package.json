@@ -1,6 +1,6 @@
 {
   "name": "obsidian-pst-import",
-  "version": "1.0.7",
+  "version": "1.1.1",
   "description": "Import Outlook PST email archives as Markdown files in Obsidian",
   "main": "main.js",
   "scripts": {
