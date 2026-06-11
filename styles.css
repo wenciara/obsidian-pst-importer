@@ -1,0 +1,75 @@
+/* PST Importer Styles */
+
+.pst-folder-item {
+  padding: 4px 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.pst-folder-select-list {
+  max-height: 400px;
+  overflow-y: auto;
+  margin: 12px 0;
+}
+
+.pst-folder-select-buttons {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.pst-importer-progress-container {
+  width: 100%;
+  height: 20px;
+  background: #e0e0e0;
+  border-radius: 10px;
+  margin: 12px 0;
+  overflow: hidden;
+}
+
+.pst-importer-progress-bar {
+  width: 0%;
+  height: 100%;
+  background: var(--interactive-accent);
+  border-radius: 10px;
+  transition: width 0.3s;
+}
+
+.pst-importer-status {
+  margin-top: 0;
+}
+
+.pst-importer-progress {
+  width: 100%;
+  height: 20px;
+  margin: 12px 0;
+}
+
+.pst-importer-progress::-webkit-progress-bar {
+  background: #e0e0e0;
+  border-radius: 10px;
+}
+
+.pst-importer-progress::-webkit-progress-value {
+  background: var(--interactive-accent);
+  border-radius: 10px;
+}
+
+.pst-importer-progress-complete::-webkit-progress-value {
+  background: var(--color-green, #4caf50);
+}
+
+.pst-importer-progress-error::-webkit-progress-value {
+  background: var(--color-red, #f44336);
+}
+
+.pst-importer-detail {
+  font-size: 0.85em;
+  color: var(--text-muted);
+  margin-top: 8px;
+}
+
+.pst-folder-name-input {
+  width: 100%;
+}

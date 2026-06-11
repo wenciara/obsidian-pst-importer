@@ -1,0 +1,40 @@
+name: Release PST Importer
+
+on:
+  push:
+    tags:
+      - "*" # Run on any tag push
+
+permissions:
+  contents: write
+
+jobs:
+  # Build Obsidian plugin
+  build-plugin:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install Node dependencies
+        run: npm ci
+
+      - name: Build plugin
+        run: npm run build
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          body: "See README.md for installation instructions."
+          files: |
+            main.js
+            manifest.json
+            styles.css
+          fail_on_unmatched_files: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

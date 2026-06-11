@@ -1,0 +1,8 @@
+node_modules/
+main.js
+*.js.map
+python/dist/
+python/build/
+python/__pycache__/
+*.spec
+.DS_Store
