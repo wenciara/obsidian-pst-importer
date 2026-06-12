@@ -57,6 +57,8 @@ export interface ImportOptions {
 
 /** 单个 PST 同步配置 */
 export interface SyncProfile {
+  /** 稳定 ID，用于保存同步状态，避免改名后丢历史 */
+  id: string;
   /** 用户自定义的名称 */
   label: string;
   /** PST 文件绝对路径 */

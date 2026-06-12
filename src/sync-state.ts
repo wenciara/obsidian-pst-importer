@@ -5,7 +5,7 @@
  * 状态通过 Obsidian plugin data 持久化。
  */
 
-import type { SyncState, SyncProfileState } from "./types";
+import type { SyncProfile, SyncState, SyncProfileState } from "./types";
 
 const SYNC_STATE_KEY = "syncState";
 
@@ -13,6 +13,30 @@ export class SyncStateManager {
   private state: SyncState;
   private loadFn: () => Promise<Record<string, unknown> | null>;
   private saveFn: (data: Record<string, unknown>) => Promise<void>;
+
+  private resolveProfileKey(profile: SyncProfile | string): string {
+    return typeof profile === "string" ? profile : profile.id || profile.label;
+  }
+
+  private ensureProfileKey(profile: SyncProfile | string): string {
+    const key = this.resolveProfileKey(profile);
+    if (typeof profile !== "string" && key !== profile.label && this.state.profiles[profile.label] && !this.state.profiles[key]) {
+      this.state.profiles[key] = this.state.profiles[profile.label];
+      delete this.state.profiles[profile.label];
+    }
+    return key;
+  }
+
+  private ensureProfileState(profile: SyncProfile | string): SyncProfileState {
+    const key = this.ensureProfileKey(profile);
+    if (!this.state.profiles[key]) {
+      this.state.profiles[key] = {
+        lastSync: new Date().toISOString(),
+        imported: [],
+      };
+    }
+    return this.state.profiles[key];
+  }
 
   constructor(
     loadFn: () => Promise<Record<string, unknown> | null>,
@@ -39,48 +63,64 @@ export class SyncStateManager {
   }
 
   /** 获取某个 profile 的已导入指纹集合 */
-  getImportedSet(profileLabel: string): Set<string> {
-    const profileState = this.state.profiles[profileLabel];
+  getImportedSet(profile: SyncProfile | string): Set<string> {
+    const key = this.ensureProfileKey(profile);
+    const profileState = this.state.profiles[key];
     if (!profileState) return new Set();
     return new Set(profileState.imported);
   }
 
   /** 检查某封邮件是否已导入 */
-  isImported(profileLabel: string, fingerprint: string): boolean {
-    const profileState = this.state.profiles[profileLabel];
+  isImported(profile: SyncProfile | string, fingerprint: string): boolean {
+    const key = this.ensureProfileKey(profile);
+    const profileState = this.state.profiles[key];
     if (!profileState) return false;
     return profileState.imported.includes(fingerprint);
   }
 
   /** 标记一封邮件为已导入 */
-  markImported(profileLabel: string, fingerprint: string): void {
-    if (!this.state.profiles[profileLabel]) {
-      this.state.profiles[profileLabel] = {
-        lastSync: new Date().toISOString(),
-        imported: [],
-      };
+  markImported(profile: SyncProfile | string, fingerprint: string): void {
+    const profileState = this.ensureProfileState(profile);
+    if (!profileState.imported.includes(fingerprint)) {
+      profileState.imported.push(fingerprint);
     }
-    this.state.profiles[profileLabel].imported.push(fingerprint);
+  }
+
+  /** 批量标记已导入（用于把现有 PST 设为同步基线） */
+  markImportedBatch(profile: SyncProfile | string, fingerprints: Iterable<string>): number {
+    const profileState = this.ensureProfileState(profile);
+    const importedSet = new Set(profileState.imported);
+    let added = 0;
+
+    for (const fingerprint of fingerprints) {
+      if (importedSet.has(fingerprint)) continue;
+      importedSet.add(fingerprint);
+      profileState.imported.push(fingerprint);
+      added++;
+    }
+
+    return added;
   }
 
   /** 更新 profile 的最后同步时间 */
-  updateLastSync(profileLabel: string): void {
-    if (!this.state.profiles[profileLabel]) {
-      this.state.profiles[profileLabel] = {
-        lastSync: new Date().toISOString(),
-        imported: [],
-      };
-    }
-    this.state.profiles[profileLabel].lastSync = new Date().toISOString();
+  updateLastSync(profile: SyncProfile | string): void {
+    const profileState = this.ensureProfileState(profile);
+    profileState.lastSync = new Date().toISOString();
   }
 
   /** 获取 profile 状态 */
-  getProfileState(profileLabel: string): SyncProfileState | undefined {
-    return this.state.profiles[profileLabel];
+  getProfileState(profile: SyncProfile | string): SyncProfileState | undefined {
+    const key = this.ensureProfileKey(profile);
+    return this.state.profiles[key];
   }
 
   /** 删除 profile 的同步状态（用于重置） */
-  deleteProfile(profileLabel: string): void {
-    delete this.state.profiles[profileLabel];
+  deleteProfile(profile: SyncProfile | string): void {
+    const key = this.resolveProfileKey(profile);
+    delete this.state.profiles[key];
+
+    if (typeof profile !== "string" && key !== profile.label) {
+      delete this.state.profiles[profile.label];
+    }
   }
 }

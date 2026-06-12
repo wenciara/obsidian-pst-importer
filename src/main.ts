@@ -16,6 +16,11 @@ import { FallbackEngine } from "./engines/fallback-engine";
 import { SyncStateManager } from "./sync-state";
 import * as path from "path";
 import * as fs from "fs";
+
+function createSyncProfileId(): string {
+  return `sync_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
+}
+
 interface ElectronLike {
   remote?: {
     dialog?: {
@@ -31,6 +36,7 @@ interface ElectronLike {
 export default class PstImporterPlugin extends Plugin {
   settings: PstImporterSettings;
   syncStateManager: SyncStateManager;
+  private settingsChangedDuringLoad = false;
 
   constructor(app: App, manifest: PluginManifest) {
     super(app, manifest);
@@ -45,6 +51,9 @@ export default class PstImporterPlugin extends Plugin {
       (data) => this.saveData(data)
     );
     await this.syncStateManager.load();
+    if (this.settingsChangedDuringLoad) {
+      await this.saveSettings();
+    }
 
     // 注册 "Import PST file..." 命令（手动导入任意 PST）
     this.addCommand({
@@ -98,10 +107,31 @@ export default class PstImporterPlugin extends Plugin {
   async loadSettings(): Promise<void> {
     const loaded = (await this.loadData()) as Partial<PstImporterSettings> | null;
     this.settings = Object.assign({}, DEFAULT_SETTINGS, loaded ?? {});
+
+    const normalizedProfiles = (this.settings.syncProfiles ?? []).map((profile) => {
+      if (profile.id) return profile;
+      this.settingsChangedDuringLoad = true;
+      return {
+        ...profile,
+        id: createSyncProfileId(),
+      };
+    });
+
+    this.settings.syncProfiles = normalizedProfiles;
   }
 
   async saveSettings(): Promise<void> {
-    await this.saveData(this.settings);
+    const existing = (await this.loadData()) as Record<string, unknown> | null;
+    await this.saveData({
+      ...(existing ?? {}),
+      ...this.settings,
+    });
+  }
+
+  getDefaultOutputFolder(defaultName: string): string {
+    const baseFolder = this.settings.outputBaseFolder.trim();
+    if (!baseFolder) return defaultName;
+    return `${baseFolder}/${defaultName}`;
   }
 
   /**
@@ -137,7 +167,7 @@ export default class PstImporterPlugin extends Plugin {
 
       // 弹输入框让用户输入导入后的文件夹名
       const defaultName = path.basename(pstPath, ".pst").replace(/[<>:"/\\|?*]/g, "_");
-      const folderName = await this.askFolderName(defaultName);
+      const folderName = await this.askFolderName(this.getDefaultOutputFolder(defaultName));
       if (!folderName) return; // 用户取消
 
       // 扫描 PST 中的邮件夹列表，让用户选择导入哪些
@@ -230,7 +260,7 @@ export default class PstImporterPlugin extends Plugin {
   /**
    * 增量同步：只导入已配置 PST 中的新邮件
    */
-  async startSync(): Promise<void> {
+  async startSync(profileOverride?: SyncProfile): Promise<void> {
     const profiles = this.settings.syncProfiles;
     if (profiles.length === 0) {
       new Notice("No sync profile configured. Go to Settings → PST Import to add one.");
@@ -239,7 +269,9 @@ export default class PstImporterPlugin extends Plugin {
 
     // 如果只有一个 profile，直接同步；否则让用户选择
     let profile: SyncProfile;
-    if (profiles.length === 1) {
+    if (profileOverride) {
+      profile = profileOverride;
+    } else if (profiles.length === 1) {
       profile = profiles[0];
     } else {
       const chosen = await this.askProfileSelection(profiles);
@@ -261,7 +293,7 @@ export default class PstImporterPlugin extends Plugin {
 
     // 加载同步状态
     await this.syncStateManager.load();
-    const importedSet = this.syncStateManager.getImportedSet(profile.label);
+    const importedSet = this.syncStateManager.getImportedSet(profile);
 
     const modal = new ProgressModal(this.app);
     modal.open();
@@ -300,7 +332,7 @@ export default class PstImporterPlugin extends Plugin {
         try {
           await vaultWriter.writeEmail(email);
           newCount++;
-          this.syncStateManager.markImported(profile.label, fp);
+          this.syncStateManager.markImported(profile, fp);
         } catch (writeErr) {
           errorCount++;
           const errMsg = writeErr instanceof Error ? writeErr.message : String(writeErr);
@@ -313,7 +345,7 @@ export default class PstImporterPlugin extends Plugin {
       }
 
       // 保存同步状态
-      this.syncStateManager.updateLastSync(profile.label);
+  this.syncStateManager.updateLastSync(profile);
       await this.syncStateManager.save();
 
       const msg = `Sync complete: ${newCount} new emails imported, ${skipCount} skipped${errorCount > 0 ? `, ${errorCount} errors` : ""}`;
@@ -325,6 +357,57 @@ export default class PstImporterPlugin extends Plugin {
       modal.setStatus(`❌ Sync failed: ${errMsg}`);
       modal.markError();
       new Notice(`PST Sync failed: ${errMsg}`);
+    }
+  }
+
+  async initializeSyncBaseline(profile: SyncProfile): Promise<void> {
+    if (!fs.existsSync(profile.pstPath)) {
+      new Notice(`PST file not found: ${profile.pstPath}`);
+      return;
+    }
+
+    const engine = await this.selectEngine(0);
+    if (!engine) {
+      new Notice("PST Import: No available parsing engine.");
+      return;
+    }
+
+    await this.syncStateManager.load();
+
+    const modal = new ProgressModal(this.app);
+    modal.open();
+    modal.setStatus("Building sync baseline from current PST...");
+
+    let scannedCount = 0;
+    let addedCount = 0;
+    const selectedFolders = profile.selectedFolders.length > 0
+      ? profile.selectedFolders
+      : undefined;
+
+    try {
+      for await (const email of engine.extract(profile.pstPath, (progress) => {
+        modal.updateProgress(progress);
+      }, selectedFolders)) {
+        scannedCount++;
+        addedCount += this.syncStateManager.markImportedBatch(profile, [emailFingerprint(email)]);
+
+        if (scannedCount % 50 === 0) {
+          modal.setStatus(`Scanned ${scannedCount} emails, recorded ${addedCount} fingerprints...`);
+        }
+      }
+
+      this.syncStateManager.updateLastSync(profile);
+      await this.syncStateManager.save();
+
+      const message = `Sync baseline ready: ${addedCount} emails marked as already imported.`;
+      modal.setStatus(`✅ ${message}`);
+      modal.markComplete();
+      new Notice(message);
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      modal.setStatus(`❌ Failed to build sync baseline: ${errMsg}`);
+      modal.markError();
+      new Notice(`Failed to build sync baseline: ${errMsg}`);
     }
   }
 
@@ -477,7 +560,7 @@ class FolderNameModal extends Modal {
     contentEl.empty();
 
     contentEl.createEl("h2", { text: "Import PST File" });
-    contentEl.createEl("p", { text: "Enter the folder name in your vault for imported emails:" });
+    contentEl.createEl("p", { text: "Enter the vault folder path for imported emails:" });
 
     let inputValue = this.defaultName;
 
